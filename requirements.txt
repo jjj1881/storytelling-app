@@ -1,0 +1,8 @@
+streamlit
+pillow
+torch
+transformers
+openai
+gtts
+edge-tts
+sentencepiece
