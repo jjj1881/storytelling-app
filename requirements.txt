@@ -1,8 +1,5 @@
 streamlit
-pillow
-torch
 transformers
-openai
-gtts
-edge-tts
-sentencepiece
+torch
+pillow
+gTTS
