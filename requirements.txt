@@ -1,5 +1,7 @@
 streamlit
-transformers
 torch
+torchvision
+transformers==4.41.2
 pillow
 gTTS
+sentencepiece
