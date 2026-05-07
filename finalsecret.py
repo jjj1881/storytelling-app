@@ -10,7 +10,7 @@ import streamlit as st
 from PIL import Image
 import torch
 from transformers import BlipForConditionalGeneration, BlipProcessor
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from gtts import gTTS
 
 try:
@@ -35,6 +35,12 @@ CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 DEFAULT_AZURE_ENDPOINT = "https://hkust.azure-api.net"
 DEFAULT_AZURE_API_VERSION = "2024-02-01"
 DEFAULT_AZURE_MODEL = "gpt-4o-mini"
+
+# OpenAI TTS model and voice.
+# If the same API key supports OpenAI's native audio endpoint, this will be used first.
+# If not, the app automatically falls back to edge-tts / gTTS.
+DEFAULT_OPENAI_TTS_MODEL = "gpt-4o-mini-tts"
+DEFAULT_OPENAI_TTS_VOICE = "nova"
 
 
 # =========================
@@ -465,23 +471,79 @@ def generate_story(
 # =========================
 # Text-to-speech
 # =========================
+def build_tts_narration_text(story: str, story_style: str) -> str:
+    """
+    Keep the output text natural for TTS.
+    OpenAI TTS handles emotion better when the input includes a short narration instruction.
+    The instruction is not shown in the UI; it only affects the generated voice.
+    """
+    style_instruction = {
+        "Bedtime": "Read this as a warm, slow bedtime story for a young child. Use a soft, gentle, soothing tone with natural pauses.",
+        "Adventure": "Read this as an exciting but child-safe adventure story. Use an energetic, cheerful tone with expressive pacing.",
+        "Magic": "Read this as a magical children's story. Use a warm, curious, playful voice with gentle wonder.",
+        "Friendship": "Read this as a kind friendship story for children. Use a friendly, caring, natural voice.",
+    }.get(
+        story_style,
+        "Read this as a warm children's story. Use a natural, friendly, expressive voice.",
+    )
+
+    return f"{style_instruction}\n\n{normalize_text(story)}"
+
+
+def openai_tts_to_bytes(
+    text: str,
+    story_style: str,
+    api_key: str,
+    tts_model: str,
+    tts_voice: str,
+) -> bytes:
+    """
+    OpenAI native TTS.
+    This requires a normal OpenAI API key that supports the audio speech endpoint.
+    If the current key is only an Azure/HKUST gateway key, this function may fail;
+    the caller will fall back to edge-tts or gTTS automatically.
+    """
+    client = OpenAI(api_key=api_key)
+    narration_text = build_tts_narration_text(text, story_style)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_file:
+        temp_path = temp_file.name
+
+    try:
+        response = client.audio.speech.create(
+            model=tts_model,
+            voice=tts_voice,
+            input=narration_text,
+            response_format="mp3",
+        )
+
+        response.stream_to_file(temp_path)
+
+        with open(temp_path, "rb") as audio_file:
+            return audio_file.read()
+
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 def voice_settings(story_style: str, slow_reading: bool) -> Tuple[str, str, str]:
     if story_style == "Bedtime":
         voice = "en-US-JennyNeural"
-        rate = "-18%" if slow_reading else "-10%"
-        pitch = "-3Hz"
+        rate = "-22%" if slow_reading else "-14%"
+        pitch = "-2Hz"
     elif story_style == "Adventure":
         voice = "en-US-GuyNeural"
-        rate = "-8%" if slow_reading else "+2%"
-        pitch = "+2Hz"
+        rate = "-10%" if slow_reading else "-3%"
+        pitch = "+3Hz"
     elif story_style == "Magic":
         voice = "en-US-AriaNeural"
-        rate = "-12%" if slow_reading else "-4%"
-        pitch = "+4Hz"
+        rate = "-14%" if slow_reading else "-6%"
+        pitch = "+5Hz"
     else:
         voice = "en-US-JennyNeural"
-        rate = "-10%" if slow_reading else "-2%"
-        pitch = "+1Hz"
+        rate = "-14%" if slow_reading else "-6%"
+        pitch = "+2Hz"
 
     return voice, rate, pitch
 
@@ -490,7 +552,7 @@ async def edge_tts_to_bytes(text: str, story_style: str, slow_reading: bool) -> 
     voice, rate, pitch = voice_settings(story_style, slow_reading)
 
     communicate = edge_tts.Communicate(
-        text=text,
+        text=normalize_text(text),
         voice=voice,
         rate=rate,
         pitch=pitch,
@@ -530,8 +592,30 @@ def gtts_to_bytes(text: str, slow_reading: bool) -> bytes:
 def text_to_speech(
     story: str,
     story_style: str,
+    api_key: str,
     slow_reading: bool = False,
+    tts_model: str = DEFAULT_OPENAI_TTS_MODEL,
+    tts_voice: str = DEFAULT_OPENAI_TTS_VOICE,
 ) -> tuple[Optional[bytes], str]:
+    """
+    Priority:
+    1. OpenAI native TTS, using the same API key if it supports the audio endpoint.
+    2. edge-tts neural voice fallback.
+    3. gTTS fallback.
+    """
+    if api_key:
+        try:
+            audio = openai_tts_to_bytes(
+                text=story,
+                story_style=story_style,
+                api_key=api_key,
+                tts_model=tts_model,
+                tts_voice=tts_voice,
+            )
+            return audio, "OpenAI expressive storytelling voice"
+        except Exception:
+            pass
+
     if edge_tts is not None:
         try:
             audio = asyncio.run(edge_tts_to_bytes(story, story_style, slow_reading))
@@ -540,7 +624,7 @@ def text_to_speech(
             pass
 
     try:
-        return gtts_to_bytes(story, slow_reading), "Gentle voice"
+        return gtts_to_bytes(story, slow_reading), "Gentle fallback voice"
     except Exception:
         return None, "Audio generation failed"
 
@@ -565,7 +649,7 @@ def render_header() -> None:
     )
 
 
-def render_sidebar() -> tuple[str, str, bool, str, str, str, str]:
+def render_sidebar() -> tuple[str, str, bool, str, str, str, str, str, str]:
     st.sidebar.markdown("## 🌈 Story Magic")
 
     child_name = st.sidebar.text_input(
@@ -600,6 +684,9 @@ def render_sidebar() -> tuple[str, str, bool, str, str, str, str]:
         "",
     ).strip()
 
+    tts_model = get_secret_or_env("OPENAI_TTS_MODEL", DEFAULT_OPENAI_TTS_MODEL).strip()
+    tts_voice = get_secret_or_env("OPENAI_TTS_VOICE", DEFAULT_OPENAI_TTS_VOICE).strip()
+
     st.sidebar.markdown("---")
     st.sidebar.markdown(
         """
@@ -621,6 +708,8 @@ def render_sidebar() -> tuple[str, str, bool, str, str, str, str]:
         api_key,
         endpoint,
         api_version,
+        tts_model,
+        tts_voice,
     )
 
 
@@ -748,7 +837,17 @@ def main() -> None:
     inject_custom_css()
     render_header()
 
-    child_name, story_style, slow_reading, model_name, api_key, endpoint, api_version = render_sidebar()
+    (
+        child_name,
+        story_style,
+        slow_reading,
+        model_name,
+        api_key,
+        endpoint,
+        api_version,
+        tts_model,
+        tts_voice,
+    ) = render_sidebar()
 
     if "result" not in st.session_state:
         st.session_state.result = {"status": "idle"}
@@ -807,7 +906,7 @@ def main() -> None:
         if not api_key:
             st.error(
                 "The story service is not configured yet. "
-                "Please add AZURE_OPENAI_API_KEY to Streamlit Cloud secrets."
+                "Please add AZURE_OPENAI_API_KEY, HKUST_AZURE_OPENAI_API_KEY, or OPENAI_API_KEY to Streamlit Cloud secrets."
             )
             return
 
@@ -860,9 +959,12 @@ def main() -> None:
                 render_live_results(st.session_state.result)
 
             audio, voice_label = text_to_speech(
-                story,
-                story_style,
-                slow_reading,
+                story=story,
+                story_style=story_style,
+                api_key=api_key,
+                slow_reading=slow_reading,
+                tts_model=tts_model,
+                tts_voice=tts_voice,
             )
 
             st.session_state.result.update(
